@@ -1,0 +1,793 @@
+;*****************************************************************
+;* Framework for HC12 absolute assembly application              *
+;*****************************************************************
+
+         XDEF  Entry, _Startup
+         ABSENTRY Entry
+         INCLUDE "derivative.inc"
+
+;EQUATES
+; -------------------------------------------------------------------------------------------------
+
+; LCD Equates
+CLEAR_HOME    EQU   $01
+INTERFACE     EQU   $38
+CURSOR_OFF    EQU   $0C
+SHIFT_OFF     EQU   $06
+LCD_SEC_LINE  EQU   64
+
+LCD_CNTR      EQU   PTJ
+LCD_DAT       EQU   PORTB
+LCD_E         EQU   $80
+LCD_RS        EQU   $40
+
+NULL          EQU   0
+CR            EQU   $0D
+SPACE         EQU   ' '
+
+; States
+START         EQU   0
+FWD           EQU   1
+ALL_STOP      EQU   2
+LEFT_TURN     EQU   3
+RIGHT_TURN    EQU   4
+REV_TURN      EQU   5
+LEFT_ALIGN    EQU   6
+RIGHT_ALIGN   EQU   7
+
+; Turning Timers (still available if you want TOF-based timing)
+T_LEFT        EQU   2
+T_RIGHT       EQU   2
+
+; -------------------------------------------------------------------------------------------------
+; RAM
+; -------------------------------------------------------------------------------------------------
+              ORG   $3800
+              
+SENSOR_LINE   FCB   $01
+SENSOR_BOW    FCB   $23
+SENSOR_PORT   FCB   $45
+SENSOR_MID    FCB   $67
+SENSOR_STBD   FCB   $89
+SENSOR_NUM    RMB   1
+
+; Baselines and variances
+BASE_LINE     FCB   $9F          ; E/F
+BASE_BOW      FCB   $CC          ; A
+BASE_MID      FCB   $CC          ; C
+BASE_PORT     FCB   $A0          ; B
+BASE_STBD     FCB   $C0          ; D
+
+VAR_LINE      FCB   $15
+VAR_BOW       FCB   $20
+VAR_PORT      FCB   $40
+VAR_MID       FCB   $20
+VAR_STBD      FCB   $40
+
+TOP_LINE      RMB   20
+              FCB   NULL
+BOT_LINE      RMB   20
+              FCB   NULL
+CLEAR_LINE    FCC   '                  '
+              FCB   NULL
+
+TEMP          RMB   1
+
+; -------------------------------------------------------------------------------------------------
+; more variables
+; -------------------------------------------------------------------------------------------------
+              ORG   $3850
+TOF_COUNTER   DC.B  0
+CRNT_STATE    DC.B  2
+T_TURN        DS.B  1
+TEN_THOUS     DS.B  1
+THOUSANDS     DS.B  1
+HUNDREDS      DS.B  1
+TENS          DS.B  1
+UNITS         DS.B  1
+NO_BLANK      DS.B  1
+HEX_TABLE     FCC   '0123456789ABCDEF'
+BCD_SPARE     RMB   2
+
+; -------------------------------------------------------------------------------------------------
+; CODE
+; -------------------------------------------------------------------------------------------------
+              ORG   $4000
+Entry:
+_Startup:
+
+; Initialization
+              LDS   #$4000
+              CLI
+              JSR   INIT
+              JSR   openADC
+              JSR   initLCD
+              JSR   CLR_LCD_BUF
+              BSET  DDRA,%00000011        ; STAR_DIR, PORT_DIR
+              BSET  DDRT,%00110000        ; STAR_SPEED, PORT_SPEED
+              JSR   initAD
+              JSR   initLCD
+              JSR   clrLCD
+              JSR   ENABLE_TOF
+
+; -------------------------------------------------------------------------------------------------
+; MAIN LOOP
+; -------------------------------------------------------------------------------------------------
+MAIN:         JSR   UPDT_DISPL
+              LDAA  CRNT_STATE
+              JSR   DISPATCHER
+
+              JSR   G_LEDS_ON
+              JSR   READ_SENSORS
+              JSR   G_LEDS_OFF
+
+              JSR   DISPLAY_SENSORS
+              BRA   MAIN
+
+; -------------------------------------------------------------------------------------------------
+; STATE NAMES FOR LCD
+; -------------------------------------------------------------------------------------------------
+tab           DC.B  "START  ",0
+              DC.B  "FWD    ",0
+              DC.B  "ALL_STP",0
+              DC.B  "LTURN  ",0
+              DC.B  "RTURN  ",0
+              DC.B  "REVTRN ",0
+              DC.B  "LADJUST",0
+              DC.B  "RADJUST",0
+
+; -------------------------------------------------------------------------------------------------
+; DISPATCHER
+; -------------------------------------------------------------------------------------------------
+DISPATCHER:   CMPA  #START
+              BNE   NOT_START
+              JSR   START_ST
+              BRA   DISP_EXIT
+
+NOT_START:    CMPA  #FWD
+              BNE   NOT_FWD
+              JSR   FWD_ST
+              BRA   DISP_EXIT
+
+NOT_FWD:      CMPA  #ALL_STOP
+              BNE   NOT_ALL_STP
+              JSR   ALL_STOP_ST
+              BRA   DISP_EXIT
+
+NOT_ALL_STP:  CMPA  #LEFT_TURN
+              BNE   NOT_LEFT_TURN
+              JSR   FULL_LEFT
+              BRA   DISP_EXIT
+
+NOT_LEFT_TURN:CMPA  #RIGHT_TURN
+              BNE   NOT_RIGHT_TURN
+              JSR   FULL_RIGHT
+              BRA   DISP_EXIT
+
+NOT_RIGHT_TURN:CMPA #REV_TURN
+              BNE   NOT_REV_TURN
+              JSR   REV_TURN_ST
+              BRA   DISP_EXIT
+
+NOT_REV_TURN: CMPA  #LEFT_ALIGN
+              BNE   NOT_LEFT_ALIGN
+              JSR   CONTINUE_FORWARD
+              BRA   DISP_EXIT
+
+NOT_LEFT_ALIGN:CMPA #RIGHT_ALIGN
+              BNE   NOT_RIGHT_ALIGN
+              JSR   CONTINUE_FORWARD
+              BRA   DISP_EXIT
+
+NOT_RIGHT_ALIGN:
+              SWI
+DISP_EXIT:    RTS
+
+; -------------------------------------------------------------------------------------------------
+; START STATE
+; -------------------------------------------------------------------------------------------------
+START_ST:     BRCLR PORTAD0,%00000100,NO_START_RELEASE
+              JSR   INIT_FWD
+              MOVB  #FWD,CRNT_STATE
+NO_START_RELEASE:
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; FORWARD STATE (WITH SLOW PULSES)
+; -------------------------------------------------------------------------------------------------
+FWD_ST:
+              ; one small forward step per loop
+              JSR   INIT_FWD          ; set forward direction
+              JSR   SLOW_FWD_STEP     ; motors on briefly, then off
+
+              ; front bumper
+              BRSET PORTAD0,%00000100,NO_FWD_BUMP
+              MOVB  #REV_TURN,CRNT_STATE
+
+              JSR   UPDT_DISPL
+              JSR   INIT_REV
+              LDY   #6000
+              JSR   del_50us
+
+              JSR   INIT_RIGHT
+              LDY   #5500
+              JSR   del_50us
+              LBRA  EXIT
+
+NO_FWD_BUMP:
+              ; rear bumper
+              BRSET PORTAD0,%00001000,NO_FWD_REAR_BUMP
+              MOVB  #ALL_STOP,CRNT_STATE
+              JSR   INIT_STOP
+              LBRA  EXIT
+
+NO_FWD_REAR_BUMP:
+              ; Alignment checks (A,C,E/F)
+              LDAA  SENSOR_BOW
+              ADDA  VAR_BOW
+              CMPA  BASE_BOW
+              BPL   NO_ALIGN
+
+              LDAA  SENSOR_MID
+              ADDA  VAR_MID
+              CMPA  BASE_MID
+              BPL   NO_ALIGN
+
+
+              LDAA  SENSOR_LINE
+              SUBA  VAR_LINE
+              CMPA  BASE_LINE
+              BMI   GO_LEFT_ALIGN
+              
+              LDAA  SENSOR_LINE
+              ADDA  VAR_LINE
+              CMPA  BASE_LINE
+              BPL   GO_RIGHT_ALIGN
+
+              
+
+NO_ALIGN:
+              ; check for left branch (PORT)
+              LDAA  SENSOR_PORT
+              ADDA  VAR_PORT
+              CMPA  BASE_PORT
+              BPL   PART_LEFT_TURN
+              BMI   NO_PORT_DET
+
+NO_PORT_DET:
+              ; forward path with BOW
+              LDAA  SENSOR_BOW
+              ADDA  VAR_BOW
+              CMPA  BASE_BOW
+              BPL   EXIT
+              BMI   NO_BOW_DET
+
+NO_BOW_DET:
+              ; check starboard for right branch
+              LDAA  SENSOR_STBD
+              ADDA  VAR_STBD
+              CMPA  BASE_STBD
+              BPL   PART_RIGHT_TURN
+              BMI   EXIT
+
+PART_LEFT_TURN:
+              LDY   #2000
+              JSR   del_50us
+              JSR   INIT_LEFT             ; set left-turn direction
+              MOVB  #LEFT_TURN,CRNT_STATE
+              LDY   #2000
+              JSR   del_50us
+              BRA   EXIT
+
+PART_RIGHT_TURN:
+              LDY   #2000
+              JSR   del_50us
+              JSR   INIT_RIGHT            ; set right-turn direction
+              MOVB  #RIGHT_TURN,CRNT_STATE
+              LDY   #2000
+              JSR   del_50us
+              BRA   EXIT
+
+GO_LEFT_ALIGN:
+              JSR   INIT_LEFT
+              MOVB  #LEFT_ALIGN,CRNT_STATE
+              BRA   EXIT
+
+GO_RIGHT_ALIGN:
+              JSR   INIT_RIGHT
+              MOVB  #RIGHT_ALIGN,CRNT_STATE
+              BRA   EXIT
+
+EXIT:         RTS
+
+; -------------------------------------------------------------------------------------------------
+; FULL LEFT TURN STATE  (NOW PULSED)
+; -------------------------------------------------------------------------------------------------
+FULL_LEFT:
+              JSR   INIT_LEFT          ; set left-turn directions
+              JSR   SLOW_FWD_STEP     ; motors on briefly, then off
+
+              LDAA  SENSOR_BOW
+              ADDA  VAR_BOW
+              CMPA  BASE_BOW
+              BPL   CONTINUE_FORWARD   ; when front sees line, go forward
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; CONTINUE FORWARD AFTER TURN
+; -------------------------------------------------------------------------------------------------
+CONTINUE_FORWARD:
+              MOVB  #FWD,CRNT_STATE
+              JSR   INIT_FWD           ; just set direction; pulses happen in FWD_ST
+                JSR   SLOW_FWD_STEP       ;
+              BRA   EXIT
+
+; -------------------------------------------------------------------------------------------------
+; FULL RIGHT TURN STATE  (NOW PULSED)
+; -------------------------------------------------------------------------------------------------
+FULL_RIGHT:
+              JSR   INIT_RIGHT         ; set right-turn directions
+              JSR   SLOW_FWD_STEP      ; pulse motors in that direction
+
+              LDAA  SENSOR_BOW
+              ADDA  VAR_BOW
+              CMPA  BASE_BOW
+              BPL   CONTINUE_FORWARD
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; REVERSE TURN STATE (still full-speed; you can slow later if needed)
+; -------------------------------------------------------------------------------------------------
+REV_TURN_ST:
+              LDAA  SENSOR_BOW
+              ADDA  VAR_BOW
+              CMPA  BASE_BOW
+              BMI   EXIT
+
+              JSR   INIT_LEFT
+              MOVB  #FWD,CRNT_STATE
+              JSR   INIT_FWD
+              BRA   EXIT
+
+; -------------------------------------------------------------------------------------------------
+; ALL STOP
+; -------------------------------------------------------------------------------------------------
+ALL_STOP_ST:
+              BRSET PORTAD0,%00000100,NO_START_BUMP
+              MOVB  #START,CRNT_STATE
+NO_START_BUMP:
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; INIT ROUTINES
+; -------------------------------------------------------------------------------------------------
+; right turn
+INIT_RIGHT:   BSET  PORTA,%00000010     ; right motor reverse
+              BCLR  PORTA,%00000001     ; left motor forward
+              LDAA  TOF_COUNTER
+              ADDA  #T_RIGHT
+              STAA  T_TURN
+              RTS
+
+; left turn
+INIT_LEFT:    BSET  PORTA,%00000001     ; left motor reverse
+              BCLR  PORTA,%00000010     ; right motor forward
+              LDAA  TOF_COUNTER
+              ADDA  #T_LEFT
+              STAA  T_TURN
+              RTS
+
+; forward direction only
+INIT_FWD:     BCLR  PORTA,%00000011     ; both motors forward
+              BSET PTT,%00110000        ; both motors on
+              RTS
+
+; one slow movement pulse (used for both forward and turning)
+SLOW_FWD_STEP:
+              BSET  PTT,%00110000       ; motors ON
+              LDY   #600                ; ~30 ms on
+              JSR   del_50us
+              BCLR  PTT,%00110000       ; motors OFF
+              LDY   #40                ; ~20 ms off
+              JSR   del_50us
+              RTS
+
+; reverse (still full-speed)
+INIT_REV:     BSET  PORTA,%00000011     ; both motors reverse
+              BSET  PTT,%00110000       ; motors ON
+              LDAA  TOF_COUNTER
+              ADDA  #T_LEFT
+              STAA  T_TURN
+              RTS
+
+; stop
+INIT_STOP:    BCLR  PTT,%00110000
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; PORT INIT
+; -------------------------------------------------------------------------------------------------
+INIT:         BCLR  DDRAD,$FF          ; PORTAD input
+              BSET  DDRA,$FF           ; PORTA output
+              BSET  DDRB,$FF           ; PORTB output
+              BSET  DDRJ,$C0           ; PTJ6,7 output
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; ADC INIT
+; -------------------------------------------------------------------------------------------------
+openADC:      MOVB  #$80,ATDCTL2
+              LDY   #1
+              JSR   del_50us
+              MOVB  #$20,ATDCTL3
+              MOVB  #$97,ATDCTL4
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; CLEAR LCD BUFFER
+; -------------------------------------------------------------------------------------------------
+CLR_LCD_BUF:  LDX   #CLEAR_LINE
+              LDY   #TOP_LINE
+              JSR   STRCPY
+CLB_SECOND:   LDX   #CLEAR_LINE
+              LDY   #BOT_LINE
+              JSR   STRCPY
+CLB_EXIT:     RTS
+
+; -------------------------------------------------------------------------------------------------
+; STRCPY
+; -------------------------------------------------------------------------------------------------
+STRCPY:       PSHX
+              PSHY
+              PSHA
+STRCPY_LOOP:  LDAA  0,X
+              STAA  0,Y
+              BEQ   STRCPY_EXIT
+              INX
+              INY
+              BRA   STRCPY_LOOP
+STRCPY_EXIT:  PULA
+              PULY
+              PULX
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; GUIDER LEDS
+; -------------------------------------------------------------------------------------------------
+G_LEDS_ON:    BSET  PORTA,%00100000
+              RTS
+
+G_LEDS_OFF:   BCLR  PORTA,%00100000
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; READ SENSORS
+; -------------------------------------------------------------------------------------------------
+READ_SENSORS: CLR   SENSOR_NUM
+              LDX   #SENSOR_LINE
+RS_MAIN_LOOP: LDAA  SENSOR_NUM
+              JSR   SELECT_SENSOR
+              LDY   #200
+              JSR   del_50us
+              LDAA  #%10000001
+              STAA  ATDCTL5
+              BRCLR ATDSTAT0,$80,*
+              LDAA  ATDDR0L
+              STAA  0,X
+              CPX   #SENSOR_STBD
+              BEQ   RS_EXIT
+              INC   SENSOR_NUM
+              INX
+              BRA   RS_MAIN_LOOP
+RS_EXIT:      RTS
+
+; -------------------------------------------------------------------------------------------------
+; SELECT SENSOR
+; -------------------------------------------------------------------------------------------------
+SELECT_SENSOR:
+              PSHA
+              LDAA  PORTA
+              ANDA  #%11100011
+              STAA  TEMP
+              PULA
+              ASLA
+              ASLA
+              ANDA  #%00011100
+              ORAA  TEMP
+              STAA  PORTA
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; DISPLAY SENSORS
+; -------------------------------------------------------------------------------------------------
+DP_FRONT_SENSOR   EQU TOP_LINE+3
+DP_PORT_SENSOR    EQU BOT_LINE+0
+DP_MID_SENSOR     EQU BOT_LINE+3
+DP_STBD_SENSOR    EQU BOT_LINE+6
+DP_LINE_SENSOR    EQU TOP_LINE+12
+
+DISPLAY_SENSORS:
+              LDAA  SENSOR_BOW
+              JSR   BIN2ASC
+              LDX   #DP_FRONT_SENSOR
+              STD   0,X
+
+              LDAA  SENSOR_PORT
+              JSR   BIN2ASC
+              LDX   #DP_PORT_SENSOR
+              STD   0,X
+
+              LDAA  SENSOR_MID
+              JSR   BIN2ASC
+              LDX   #DP_MID_SENSOR
+              STD   0,X
+
+              LDAA  SENSOR_STBD
+              JSR   BIN2ASC
+              LDX   #DP_STBD_SENSOR
+              STD   0,X
+
+              LDAA  SENSOR_LINE
+              JSR   BIN2ASC
+              LDX   #DP_LINE_SENSOR
+              STD   0,X
+
+              LDAA  #CLEAR_HOME
+              JSR   cmd2LCD
+
+              LDY   #40
+              JSR   del_50us
+
+              LDX   #TOP_LINE
+              JSR   putsLCD
+
+              LDAA  #LCD_SEC_LINE
+              JSR   LCD_POS_CRSR
+
+              LDX   #BOT_LINE
+              JSR   putsLCD
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; LCD / DELAY UTILS
+; -------------------------------------------------------------------------------------------------
+initLCD:      LDY   #2000
+              JSR   del_50us
+              LDAA  #$28
+              JSR   cmd2LCD
+              LDAA  #$0C
+              JSR   cmd2LCD
+              LDAA  #$06
+              JSR   cmd2LCD
+              RTS
+                  
+clrLCD:       LDAA  #$01
+              JSR   cmd2LCD
+              LDY   #40
+              JSR   del_50us
+              RTS
+                  
+del_50us:     PSHX
+eloop:        LDX   #300
+iloop:        NOP
+              DBNE  X,iloop
+              DBNE  Y,eloop
+              PULX
+              RTS
+                  
+cmd2LCD:      BCLR  LCD_CNTR,LCD_RS
+              JSR   dataMov
+              RTS
+                  
+putsLCD:      LDAA  1,X+
+              BEQ   donePS
+              JSR   putcLCD
+              BRA   putsLCD
+donePS:       RTS
+
+putcLCD:      BSET  LCD_CNTR,LCD_RS
+              JSR   dataMov
+              RTS
+                  
+dataMov:      BSET  LCD_CNTR,LCD_E
+              STAA  LCD_DAT
+              BCLR  LCD_CNTR,LCD_E
+               
+              LSLA
+              LSLA
+              LSLA
+              LSLA
+               
+              BSET  LCD_CNTR,LCD_E
+              STAA  LCD_DAT
+              BCLR  LCD_CNTR,LCD_E
+               
+              LDY   #1
+              JSR   del_50us
+              RTS
+
+initAD:       MOVB  #$C0,ATDCTL2
+              JSR   del_50us
+              MOVB  #$00,ATDCTL3
+              MOVB  #$85,ATDCTL4
+              BSET  ATDDIEN,$0C
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; INT TO BCD, BIN2ASC, BCD2ASC (unchanged)
+; -------------------------------------------------------------------------------------------------
+int2BCD:      XGDX
+              LDAA  #0
+              STAA  TEN_THOUS
+              STAA  THOUSANDS
+              STAA  HUNDREDS
+              STAA  TENS
+              STAA  UNITS
+              STAA  BCD_SPARE
+              STAA  BCD_SPARE+1
+                  
+              CPX   #0
+              BEQ   CON_EXIT
+                  
+              XGDX
+              LDX   #10
+              IDIV
+              STAB  UNITS
+              CPX   #0
+              BEQ   CON_EXIT
+                  
+              XGDX
+              LDX   #10
+              IDIV
+              STAB  TENS
+              CPX   #0
+              BEQ   CON_EXIT
+                  
+              XGDX
+              LDX   #10
+              IDIV
+              STAB  HUNDREDS
+              CPX   #0
+              BEQ   CON_EXIT
+                  
+              XGDX
+              LDX   #10
+              IDIV
+              STAB  THOUSANDS
+              CPX   #0
+              BEQ   CON_EXIT
+                  
+              XGDX
+              LDX   #10
+              IDIV
+              STAB  TEN_THOUS
+CON_EXIT:     RTS
+
+LCD_POS_CRSR: ORAA  #%10000000
+              JSR   cmd2LCD
+              RTS
+                  
+BIN2ASC:      PSHA
+              TAB
+              ANDB #%00001111
+              CLRA
+              ADDD #HEX_TABLE
+              XGDX
+              LDAA 0,X          ; low nibble char in A
+
+              PULB              ; original value
+              PSHA              ; save low char
+              RORB
+              RORB
+              RORB
+              RORB
+              ANDB #%00001111
+              CLRA
+              ADDD #HEX_TABLE
+              XGDX
+              LDAA 0,X          ; high nibble char in A
+              PULB              ; low nibble char in B
+              RTS
+
+BCD2ASC:      LDAA  #0
+              STAA  NO_BLANK
+              
+C_TTHOU:      LDAA  TEN_THOUS
+              ORAA  NO_BLANK
+              BNE   NOT_BLANK1
+
+ISBLANK1:     LDAA  #' '
+              STAA  TEN_THOUS
+              BRA   C_THOU
+              
+NOT_BLANK1:   LDAA  TEN_THOUS
+              ORAA  #$30
+              STAA  TEN_THOUS
+              LDAA  #$1
+              STAA  NO_BLANK
+
+C_THOU:       LDAA  THOUSANDS
+              ORAA  NO_BLANK
+              BNE   NOT_BLANK2
+
+ISBLANK2:     LDAA  #' '
+              STAA  THOUSANDS
+              BRA   C_HUNS
+
+NOT_BLANK2:   LDAA  THOUSANDS
+              ORAA  #$30
+              STAA  THOUSANDS
+              LDAA  #$1
+              STAA  NO_BLANK
+              
+C_HUNS:       LDAA  HUNDREDS
+              ORAA  NO_BLANK
+              BNE   NOT_BLANK3
+
+ISBLANK3:     LDAA  #' '
+              STAA  HUNDREDS
+              BRA   C_TENS
+
+NOT_BLANK3:   LDAA  HUNDREDS
+              ORAA  #$30
+              STAA  HUNDREDS
+              LDAA  #$1
+              STAA  NO_BLANK
+
+C_TENS:       LDAA  TENS
+              ORAA  NO_BLANK
+              BNE   NOT_BLANK4
+
+ISBLANK4:     LDAA  #' '
+              STAA  TENS
+              BRA   C_UNITS
+
+NOT_BLANK4:   LDAA  TENS
+              ORAA  #$30
+              STAA  TENS
+
+C_UNITS:      LDAA  UNITS
+              ORAA  #$30
+              STAA  UNITS
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; TIMER / TOF
+; -------------------------------------------------------------------------------------------------
+ENABLE_TOF:   LDAA  #%10000000
+              STAA  TSCR1
+              STAA  TFLG2
+              LDAA  #%10000100
+              STAA  TSCR2
+              RTS
+
+TOF_ISR:      INC   TOF_COUNTER
+              LDAA  #%10000000
+              STAA  TFLG2
+              RTI
+
+; -------------------------------------------------------------------------------------------------
+; UPDATE DISPLAY (STATE ONLY)
+; -------------------------------------------------------------------------------------------------
+UPDT_DISPL:   MOVB  #$90,ATDCTL5
+              BRCLR ATDSTAT0,$80,*
+
+              LDAA  #$C9
+              JSR   cmd2LCD
+              LDAB  CRNT_STATE
+              LSLB
+              LSLB
+              LSLB
+              LDX   #tab
+              ABX
+              JSR   putsLCD
+              RTS
+
+; -------------------------------------------------------------------------------------------------
+; VECTORS
+; -------------------------------------------------------------------------------------------------
+              ORG   $FFFE
+              DC.W  Entry
+              ORG   $FFDE
+              DC.W  TOF_ISR
+
